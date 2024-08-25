@@ -93,9 +93,9 @@ impl App {
         let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
         let mut data = AppData::default();
         let instance = create_instance(&window, &entry, &mut data)?;
-        let device = create_logical_device(&entry, &instance, &mut data)?;
 
         pick_physical_device(&instance, &mut data)?;
+        let device = create_logical_device(&entry, &instance, &mut data)?;
 
         self.window = Some(window);
         self.entry = Some(entry);
