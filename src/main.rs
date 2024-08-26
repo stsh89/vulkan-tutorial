@@ -25,6 +25,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 const VALIDATION_ENABLED: bool = cfg!(debug_assertions);
@@ -38,6 +39,7 @@ struct App {
     entry: Option<Entry>,
     instance: Option<Instance>,
     window: Option<Window>,
+    frame: usize,
 }
 
 #[derive(Default)]
@@ -46,11 +48,17 @@ struct AppData {
     command_pool: vk::CommandPool,
     framebuffers: Vec<vk::Framebuffer>,
     graphics_queue: vk::Queue,
+    image_available_semaphore: vk::Semaphore,
+    image_available_semaphores: Vec<vk::Semaphore>,
+    images_in_flight: Vec<vk::Fence>,
+    in_flight_fences: Vec<vk::Fence>,
     messenger: vk::DebugUtilsMessengerEXT,
     physical_device: vk::PhysicalDevice,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     present_queue: vk::Queue,
+    render_finished_semaphore: vk::Semaphore,
+    render_finished_semaphores: Vec<vk::Semaphore>,
     render_pass: vk::RenderPass,
     surface: vk::SurfaceKHR,
     swapchain_extent: vk::Extent2D,
@@ -88,6 +96,9 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
+                unsafe {
+                    self.device.as_ref().unwrap().device_wait_idle().unwrap();
+                }
                 unsafe { self.destroy() };
             }
             WindowEvent::RedrawRequested => {
@@ -104,7 +115,7 @@ impl ApplicationHandler for App {
                 // You only need to call this if you've determined that you need to redraw in
                 // applications which do not always need to. Applications that redraw continuously
                 // can render here instead.
-                self.window.as_ref().unwrap().request_redraw();
+                unsafe { self.render() }.unwrap();
             }
             _ => (),
         }
@@ -112,6 +123,59 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    unsafe fn render(&mut self) -> Result<()> {
+        let window = self.window.as_ref().unwrap();
+        let data = self.data.as_mut().unwrap();
+        let device = self.device.as_ref().unwrap();
+
+        let in_flight_fence = data.in_flight_fences[self.frame];
+
+        device.wait_for_fences(&[in_flight_fence], true, u64::MAX)?;
+
+        let image_index = device
+            .acquire_next_image_khr(
+                data.swapchain,
+                u64::MAX,
+                data.image_available_semaphores[self.frame],
+                vk::Fence::null(),
+            )?
+            .0 as usize;
+
+        let image_in_flight = data.images_in_flight[image_index];
+        if !image_in_flight.is_null() {
+            device.wait_for_fences(&[image_in_flight], true, u64::MAX)?;
+        }
+
+        data.images_in_flight[image_index] = in_flight_fence;
+
+        let wait_semaphores = &[data.image_available_semaphores[self.frame]];
+        let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let command_buffers = &[data.command_buffers[image_index]];
+        let signal_semaphores = &[data.render_finished_semaphores[self.frame]];
+        let submit_info = vk::SubmitInfo::builder()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(command_buffers)
+            .signal_semaphores(signal_semaphores);
+
+        device.reset_fences(&[in_flight_fence])?;
+
+        device.queue_submit(data.graphics_queue, &[submit_info], in_flight_fence)?;
+
+        let swapchains = &[data.swapchain];
+        let image_indices = &[image_index as u32];
+        let present_info = vk::PresentInfoKHR::builder()
+            .wait_semaphores(signal_semaphores)
+            .swapchains(swapchains)
+            .image_indices(image_indices);
+
+        device.queue_present_khr(data.present_queue, &present_info)?;
+
+        self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        Ok(())
+    }
+
     unsafe fn update(&mut self, window: Window) -> Result<()> {
         let loader = LibloadingLoader::new(LIBRARY)?;
         let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
@@ -120,19 +184,23 @@ impl App {
         data.surface = vk_window::create_surface(&instance, &window, &window)?;
 
         pick_physical_device(&instance, &mut data)?;
+
         let device = create_logical_device(&entry, &instance, &mut data)?;
         create_swapchain(&window, &instance, &device, &mut data)?;
+        create_swapchain_image_views(&device, &mut data)?;
         create_render_pass(&instance, &device, &mut data)?;
         create_pipeline(&device, &mut data)?;
         create_framebuffers(&device, &mut data)?;
         create_command_pool(&instance, &device, &mut data)?;
         create_command_buffers(&device, &mut data)?;
+        create_sync_objects(&device, &mut data)?;
 
         self.window = Some(window);
         self.entry = Some(entry);
         self.instance = Some(instance);
         self.data = Some(data);
         self.device = Some(device);
+        self.frame = 0;
 
         Ok(())
     }
@@ -147,10 +215,23 @@ impl App {
             instance.destroy_debug_utils_messenger_ext(data.messenger, None);
         }
 
+        data.in_flight_fences
+            .iter()
+            .for_each(|f| device.destroy_fence(*f, None));
+
         data.framebuffers
             .iter()
             .for_each(|f| device.destroy_framebuffer(*f, None));
 
+        data.render_finished_semaphores
+            .iter()
+            .for_each(|s| device.destroy_semaphore(*s, None));
+        data.image_available_semaphores
+            .iter()
+            .for_each(|s| device.destroy_semaphore(*s, None));
+
+        device.destroy_semaphore(data.render_finished_semaphore, None);
+        device.destroy_semaphore(data.image_available_semaphore, None);
         device.destroy_command_pool(data.command_pool, None);
         device.destroy_pipeline(data.pipeline, None);
         device.destroy_render_pass(data.render_pass, None);
@@ -615,6 +696,8 @@ unsafe fn create_render_pass(
     device: &Device,
     data: &mut AppData,
 ) -> Result<()> {
+    // Attachments
+
     let color_attachment = vk::AttachmentDescription::builder()
         .format(data.swapchain_format)
         .samples(vk::SampleCountFlags::_1)
@@ -625,6 +708,8 @@ unsafe fn create_render_pass(
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
 
+    // Subpasses
+
     let color_attachment_ref = vk::AttachmentReference::builder()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
@@ -634,11 +719,25 @@ unsafe fn create_render_pass(
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(color_attachments);
 
+    // Dependencies
+
+    let dependency = vk::SubpassDependency::builder()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+    // Create
+
     let attachments = &[color_attachment];
     let subpasses = &[subpass];
+    let dependencies = &[dependency];
     let info = vk::RenderPassCreateInfo::builder()
         .attachments(attachments)
-        .subpasses(subpasses);
+        .subpasses(subpasses)
+        .dependencies(dependencies);
 
     data.render_pass = device.create_render_pass(&info, None)?;
 
@@ -677,6 +776,29 @@ unsafe fn create_command_pool(
         .queue_family_index(indices.graphics);
 
     data.command_pool = device.create_command_pool(&info, None)?;
+
+    Ok(())
+}
+
+unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()> {
+    let semaphore_info = vk::SemaphoreCreateInfo::builder();
+    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+
+    for _ in 0..MAX_FRAMES_IN_FLIGHT {
+        data.image_available_semaphores
+            .push(device.create_semaphore(&semaphore_info, None)?);
+        data.render_finished_semaphores
+            .push(device.create_semaphore(&semaphore_info, None)?);
+
+        data.in_flight_fences
+            .push(device.create_fence(&fence_info, None)?);
+    }
+
+    data.images_in_flight = data
+        .swapchain_images
+        .iter()
+        .map(|_| vk::Fence::null())
+        .collect();
 
     Ok(())
 }
