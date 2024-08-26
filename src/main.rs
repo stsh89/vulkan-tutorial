@@ -42,6 +42,7 @@ struct App {
 
 #[derive(Default)]
 struct AppData {
+    framebuffers: Vec<vk::Framebuffer>,
     graphics_queue: vk::Queue,
     messenger: vk::DebugUtilsMessengerEXT,
     physical_device: vk::PhysicalDevice,
@@ -121,6 +122,7 @@ impl App {
         create_swapchain(&window, &instance, &device, &mut data)?;
         create_render_pass(&instance, &device, &mut data)?;
         create_pipeline(&device, &mut data)?;
+        create_framebuffers(&device, &mut data)?;
 
         self.window = Some(window);
         self.entry = Some(entry);
@@ -140,6 +142,10 @@ impl App {
         if VALIDATION_ENABLED {
             instance.destroy_debug_utils_messenger_ext(data.messenger, None);
         }
+
+        data.framebuffers
+            .iter()
+            .for_each(|f| device.destroy_framebuffer(*f, None));
 
         device.destroy_pipeline(data.pipeline, None);
         device.destroy_render_pass(data.render_pass, None);
@@ -630,6 +636,26 @@ unsafe fn create_render_pass(
         .subpasses(subpasses);
 
     data.render_pass = device.create_render_pass(&info, None)?;
+
+    Ok(())
+}
+
+unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()> {
+    data.framebuffers = data
+        .swapchain_image_views
+        .iter()
+        .map(|i| {
+            let attachments = &[*i];
+            let create_info = vk::FramebufferCreateInfo::builder()
+                .render_pass(data.render_pass)
+                .attachments(attachments)
+                .width(data.swapchain_extent.width)
+                .height(data.swapchain_extent.height)
+                .layers(1);
+
+            device.create_framebuffer(&create_info, None)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(())
 }
